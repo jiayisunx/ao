@@ -3,20 +3,30 @@
 import copy
 import functools
 import itertools
+import math
+import operator
 from typing import Any
 
 import torch
 from torch._dynamo.utils import counters
-from torch._inductor.fx_passes.freezing_patterns import register_freezing_graph_pattern
+from torch.fx.experimental.symbolic_shapes import has_free_symbols
+from torch.fx.node import map_arg
+
+from torch._inductor import config
+from torch._inductor.lowering import lowerings as L, require_channels_last
 from torch._inductor.pattern_matcher import (
     Arg,
     CallFunction,
-    KeywordArg,
-    Match,
     filter_nodes,
+    KeywordArg,
+    ListOf,
+    Match,
+    stable_topological_sort,
 )
-from torch.fx.experimental.symbolic_shapes import has_free_symbols
-from torch.fx.node import map_arg
+from torch._inductor.utils import pad_listlike
+from torch._inductor.fx_passes.freezing_patterns import register_freezing_graph_pattern
+from torch._inductor.fx_passes.post_grad import register_lowering_pattern
+
 
 aten = torch.ops.aten
 prims = torch.ops.prims
@@ -404,6 +414,88 @@ def _is_valid_qconv_post_op_fusion_pattern(has_binary_post_op=False):
     )
 
 
+def _is_valid_qconv_lowering_pattern():
+    def fn(match):
+        if len(match.nodes) != 1:
+            return False
+        return match.nodes[0].target in (
+            torch.ops.onednn.qconv_pointwise.default,
+            torch.ops.onednn.qconv_pointwise.tensor,
+            torch.ops.onednn.qconv2d_pointwise.binary,
+            torch.ops.onednn.qconv2d_pointwise.binary_tensor,
+        )
+
+    return fn
+
+
+def _register_quantized_conv_lowering(
+    pattern,
+    pass_number,
+    computation_op,
+):
+    @register_lowering_pattern(
+        pattern,
+        extra_check=_is_valid_qconv_lowering_pattern(),
+        pass_number=pass_number,
+    )
+    def qconv(match: Match, *args, **kwargs):
+        # Activation QParams
+        x, x_scale, x_zp = (
+            kwargs["x"],
+            kwargs["x_scale"],
+            kwargs["x_zp"],
+        )
+        # Weight QParams
+        packed_weight, w_scale, w_zp = (
+            kwargs["packed_weight"],
+            kwargs["w_scale"],
+            kwargs["w_zp"],
+        )
+        # Conv Params
+        b, stride, padding, dilation, groups = (
+            kwargs["b"],
+            kwargs["stride"],
+            kwargs["padding"],
+            kwargs["dilation"],
+            kwargs["groups"],
+        )
+        output_dtype = _get_pattern_output_dtype(match)
+        assert output_dtype in [torch.int8, torch.uint8, torch.float32, torch.bfloat16]
+        # Output QParams
+        o_inv_scale = kwargs["output_scale"]
+        o_zero_point = kwargs["output_zero_point"]
+        output_dtype = kwargs["output_dtype"]
+        # post op
+        postop_name = kwargs["postop_name"]
+        postop_args = kwargs["postop_args"]
+        postop_algorithm = kwargs["postop_algorithm"]
+
+        computation_args = (
+            x,
+            x_scale,
+            x_zp,
+            packed_weight,
+            w_scale,
+            w_zp,
+            b,
+            stride,
+            padding,
+            dilation,
+            groups,
+            o_inv_scale,
+            o_zero_point,
+            output_dtype,
+            postop_name,
+            postop_args,
+            postop_algorithm,
+        )
+        counters["inductor"]["qconv_unary_lower_count"] += 1
+        counters["inductor"]["qconv_unary_lower_nodes"] += len(match.nodes)
+        return L[computation_op](*computation_args)
+
+    return qconv
+
+
 def _is_valid_quantized_linear_optimization_pattern():
     def fn(match):
         output_dtype = _get_pattern_output_dtype(match)
@@ -426,6 +518,159 @@ def _is_valid_qlinear_post_op_fusion_pattern(has_binary_post_op=False):
         if has_binary_post_op
         else _is_valid_quantized_linear_optimization_pattern()
     )
+
+
+def _is_valid_qlinear_lowering_pattern():
+    def fn(match):
+        if len(match.nodes) != 1:
+            return False
+        return match.nodes[0].target in (
+            torch.ops.onednn.qlinear_pointwise.default,
+            torch.ops.onednn.qlinear_pointwise.tensor,
+            torch.ops.onednn.qlinear_pointwise.binary,
+            torch.ops.onednn.qlinear_pointwise.binary_tensor,
+        )
+
+    return fn
+
+
+def _register_quantized_linear_unary_lowering(
+    pattern,
+    pass_number,
+    computation_op,
+):
+    @register_lowering_pattern(
+        pattern,
+        extra_check=_is_valid_qlinear_lowering_pattern(),
+        pass_number=pass_number,
+    )
+    def qlinear(match: Match, *args, **kwargs):
+        output_dtype = _get_pattern_output_dtype(match)
+        # Activation QParams
+        x, x_scale, x_zp = (
+            kwargs["x"],
+            kwargs["x_scale"],
+            kwargs["x_zp"],
+        )
+        # Weight QParams
+        packed_weight, w_scale, w_zp = (
+            kwargs["packed_weight"],
+            kwargs["w_scale"],
+            kwargs["w_zp"],
+        )
+
+        # bias
+        b = kwargs.get("b")
+
+        # Output QParams
+        o_inv_scale = kwargs["output_scale"]
+        o_zero_point = kwargs["output_zero_point"]
+
+        # post op
+        postop_name = kwargs["postop_name"]
+        postop_args = kwargs["postop_args"]
+        postop_algorithm = kwargs["postop_algorithm"]
+
+        computation_args = (
+            x,
+            x_scale,
+            x_zp,
+            packed_weight,
+            w_scale,
+            w_zp,
+            b,
+            o_inv_scale,
+            o_zero_point,
+            output_dtype,
+            postop_name,
+            postop_args,
+            postop_algorithm,
+        )
+        counters["inductor"]["qlinear_unary_lower_count"] += 1
+        counters["inductor"]["qlinear_unary_lower_nodes"] += len(match.nodes)
+        return L[computation_op](*computation_args)
+
+    return qlinear
+
+
+def _register_quantized_linear_binary_lowering(
+    pattern,
+    pass_number,
+    computation_op,
+):
+    @register_lowering_pattern(
+        pattern,
+        extra_check=_is_valid_qlinear_lowering_pattern(),
+        pass_number=pass_number,
+    )
+    def qlinear_binary(match: Match, *args, **kwargs):
+        output_dtype = _get_pattern_output_dtype(match)
+        assert output_dtype is not None
+        # Activation QParams
+        x, x_scale, x_zp = (
+            kwargs["x"],
+            kwargs["x_scale"],
+            kwargs["x_zp"],
+        )
+        x2 = kwargs["x_2"]
+        x2_scale = kwargs["x2_scale"]
+        x2_zp = kwargs["x2_zp"]
+        # Weight QParams
+        packed_weight, w_scale, w_zp = (
+            kwargs["packed_weight"],
+            kwargs["w_scale"],
+            kwargs["w_zp"],
+        )
+        # bias
+        b = kwargs.get("b")
+        # Output QParams
+        o_inv_scale = kwargs["output_scale"]
+        o_zero_point = kwargs["output_zero_point"]
+
+        x2.realize()
+        from torch._inductor.fx_passes.mkldnn_fusion import _can_be_inplace
+
+        binary_op_name = kwargs["binary_op_name"]
+        alpha = kwargs["alpha"]
+        unary_op_name = kwargs["unary_op_name"]
+        unary_op_args = kwargs["unary_op_args"]
+        unary_op_algorithm = kwargs["unary_op_algorithm"]
+
+        if binary_op_name == "sum" and not _can_be_inplace(x2):
+            # When we enable the GEMM Template, the output of QLinear
+            # will be reshaped from 2D back to 3D if the input is 3D.
+            # This causes _can_be_inplace(x2) to return False if x2 happens
+            # to be the output of QLinear in this scenario.
+            # Change the post op from sum to binary add for this case.
+            # Refer to test case:
+            #   test_mkldnn_pattern_matcher.py::test_qlinear_dequant_promotion_cpu_input_dim_exceeds_2
+            binary_op_name = "add"
+
+        computation_args = (
+            x,
+            x_scale,
+            x_zp,
+            packed_weight,
+            w_scale,
+            w_zp,
+            x2,
+            b,
+            o_inv_scale,
+            o_zero_point,
+            output_dtype,
+            x2_scale,
+            x2_zp,
+            binary_op_name,
+            alpha,
+            unary_op_name,
+            unary_op_args,
+            unary_op_algorithm,
+        )
+        counters["inductor"]["qlinear_binary_lower_count"] += 1
+        counters["inductor"]["qlinear_binary_lower_nodes"] += len(match.nodes)
+        return L[computation_op](*computation_args)
+
+    return qlinear_binary
 
 
 def _is_valid_qconv_binary_optimization_pattern():
@@ -521,6 +766,646 @@ def _is_valid_quantized_op_binary_optimization_pattern(
         return True
 
     return fn
+
+
+def _register_quantized_conv_binary_lowering(
+    pattern,
+    pass_number,
+    computation_op,
+):
+    @register_lowering_pattern(
+        pattern,
+        extra_check=_is_valid_qconv_lowering_pattern(),
+        pass_number=pass_number,
+    )
+    def qconv_binary(match: Match, *args, **kwargs):
+        output_dtype = _get_pattern_output_dtype(match)
+        assert output_dtype is not None
+        x, x_scale, x_zp = kwargs["x"], kwargs["x_scale"], kwargs["x_zp"]
+        accum = kwargs["accum"]
+        accum_scale = kwargs["accum_scale"]
+        accum_zp = kwargs["accum_zero_point"]
+        packed_weight, w_scale, w_zp = (
+            kwargs["packed_weight"],
+            kwargs["w_scale"],
+            kwargs["w_zp"],
+        )
+        b, stride, padding, dilation, groups = (
+            kwargs["b"],
+            kwargs["stride"],
+            kwargs["padding"],
+            kwargs["dilation"],
+            kwargs["groups"],
+        )
+        # Output QParams
+        output_scale = kwargs["output_scale"]
+        output_zero_point = kwargs["output_zero_point"]
+
+        # post ops
+        binary_op_name = kwargs["binary_op_name"]
+        alpha = kwargs["alpha"]
+        unary_op_name = kwargs["unary_op_name"]
+        unary_op_args = kwargs["unary_op_args"]
+        unary_op_algorithm = kwargs["unary_op_algorithm"]
+
+        accum.realize()
+        from torch._inductor.fx_passes.mkldnn_fusion import _can_be_inplace
+
+        assert _can_be_inplace(accum), (
+            "QConv Binary Inplace Fusion requires accum is not an alias or mutation."
+        )
+
+        computation_args = (
+            x,
+            x_scale,
+            x_zp,
+            packed_weight,
+            w_scale,
+            w_zp,
+            accum,
+            b,
+            stride,
+            padding,
+            dilation,
+            groups,
+            output_scale,
+            output_zero_point,
+            output_dtype,
+            accum_scale,
+            accum_zp,
+            binary_op_name,
+            alpha,
+            unary_op_name,
+            unary_op_args,
+            unary_op_algorithm,
+        )
+        counters["inductor"]["qconv2d_binary_lower_count"] += 1
+        counters["inductor"]["qconv2d_binary_lower_nodes"] += len(match.nodes)
+        return L[computation_op](*computation_args)
+
+    return qconv_binary
+
+
+def _register_quantization_unary_lowering():
+    # QConv2d
+    for users in [1, 2]:
+        qconv_pattern = get_qconv_pt2e_pattern(users)
+        _register_quantized_conv_lowering(
+            qconv_pattern,
+            2,  # pass_number
+            torch.ops.onednn.qconv_pointwise.default,  # computation_op
+        )
+
+    # QLinear
+    for x_scale_zp_are_tensors in (False, True):
+        qlinear_pattern = get_qlinear_pt2e_pattern(x_scale_zp_are_tensors)
+        computation_op = (
+            torch.ops.onednn.qlinear_pointwise.tensor
+            if x_scale_zp_are_tensors
+            else torch.ops.onednn.qlinear_pointwise.default
+        )
+        _register_quantized_linear_unary_lowering(
+            qlinear_pattern,
+            2,  # pass_number
+            computation_op,
+        )
+
+
+def _register_quantization_binary_lowering():
+    # QConv2d
+    for users in (1, 2):
+        qconv_pattern = get_qconv2d_binary_pt2e_pattern(users)
+        _register_quantized_conv_binary_lowering(
+            qconv_pattern,
+            2,  # pass_number
+            torch.ops.onednn.qconv2d_pointwise.binary,  # computation_op
+        )
+
+    # QLinear
+    for x_scale_zp_are_tensors in (False, True):
+        qlinear_pattern = get_qlinear_binary_pt2e_pattern(x_scale_zp_are_tensors)
+        computation_op = (
+            torch.ops.onednn.qlinear_pointwise.binary_tensor
+            if x_scale_zp_are_tensors
+            else torch.ops.onednn.qlinear_pointwise.binary
+        )
+        _register_quantized_linear_binary_lowering(
+            qlinear_pattern,
+            2,  # pass_number
+            computation_op,
+        )
+
+
+def _is_valid_quantized_maxpool2d_optimization_pattern():
+    def fn(match):
+        # Only match the pattern which max_pool2d_with_indices returns value
+        # instead of indices.
+        get_item_node = filter_nodes(match.nodes, operator.getitem)[0]
+        return get_item_node.args[1] == 0
+
+    return fn
+
+
+def _register_quantized_maxpool2d_lowering(
+    pattern,
+    computation_op,
+):
+    @register_lowering_pattern(
+        pattern,
+        extra_check=_is_valid_quantized_maxpool2d_optimization_pattern(),
+    )
+    def qmaxpool2d(match: Match, *args, **kwargs):
+        x = kwargs["x"]
+        kernel_size = kwargs["kernel_size"]
+        stride = kwargs.get("stride")
+        padding = kwargs.get("padding", 0)
+        dilation = kwargs.get("dilation", 1)
+        ceil_mode = kwargs.get("ceil_mode", False)
+
+        if padding == 0:
+            padding = [0, 0]
+        if dilation == 1:
+            dilation = [1, 1]
+        if not stride:
+            stride = kernel_size
+        kernel_size = pad_listlike(kernel_size, 2)
+        stride = pad_listlike(stride, 2)
+        padding = pad_listlike(padding, 2)
+        dilation = pad_listlike(dilation, 2)
+
+        assert len(kernel_size) == 2
+        assert len(stride) == 2
+        assert len(padding) == 2
+        assert len(dilation) == 2
+
+        computation_args = (
+            x,
+            kernel_size,
+            stride,
+            padding,
+            dilation,
+            ceil_mode,
+        )
+        computation_args, _ = require_channels_last(computation_op, *computation_args)
+        counters["inductor"]["qmaxpool2d_matcher_count"] += 1
+        counters["inductor"]["qmaxpool2d_matcher_nodes"] += len(match.nodes)
+        return L[computation_op](*computation_args)
+
+    return qmaxpool2d
+
+
+def _register_quantization_maxpool2d():
+    # Currently, the default parameters are not in FX Graph generated by Dynamo export.
+    # So, if user defines nn.MaxPool2d with different assignment of default parameter,
+    # it will generate graph with different number of input nodes and hence
+    # different pattern to be matched.
+    # Refer to the issue: https://github.com/pytorch/pytorch/issues/105901
+    max_pool2d_args_list = [
+        [
+            KeywordArg("stride"),
+        ],
+        [
+            KeywordArg("stride"),
+            KeywordArg("padding"),
+        ],
+        [
+            KeywordArg("stride"),
+            KeywordArg("padding"),
+            KeywordArg("dilation"),
+        ],
+        [
+            KeywordArg("stride"),
+            KeywordArg("padding"),
+            KeywordArg("dilation"),
+            KeywordArg("ceil_mode"),
+        ],
+    ]
+    for max_pool2d_args in max_pool2d_args_list:
+        dequantize_maxpool2d_pattern = CallFunction(
+            aten.max_pool2d_with_indices.default,
+            get_dequantize_per_tensor_activation_pattern(),
+            KeywordArg("kernel_size"),
+            *max_pool2d_args,
+        )
+        dequantize_lowmem_maxpool2d_pattern = CallFunction(
+            prims._low_memory_max_pool_with_offsets.default,
+            get_dequantize_per_tensor_activation_pattern(),
+            KeywordArg("kernel_size"),
+            *max_pool2d_args,
+            KeywordArg("offset_dtype"),
+        )
+        dequantize_maxpool2d_get_item_pattern = CallFunction(
+            operator.getitem,
+            dequantize_maxpool2d_pattern,
+            Arg(),
+        )
+        dequantize_lowmem_maxpool2d_get_item_pattern = CallFunction(
+            operator.getitem,
+            dequantize_lowmem_maxpool2d_pattern,
+            Arg(),
+        )
+        _register_quantized_maxpool2d_lowering(
+            generate_pattern_with_output_quant(dequantize_maxpool2d_get_item_pattern),
+            quantized.max_pool2d.default,
+        )
+        _register_quantized_maxpool2d_lowering(
+            generate_pattern_with_output_quant(
+                dequantize_lowmem_maxpool2d_get_item_pattern
+            ),
+            quantized.max_pool2d.default,
+        )
+
+
+def _is_input_output_same_scale_zp(check_node):
+    def fn(match):
+        # Ensure all the inputs and output has same scale and zero point
+        # Step 1: Check inputs/output zero point
+        # Get dequant nodes at input
+        dequant_nodes = filter_nodes(
+            match.nodes, quantized_decomposed.dequantize_per_tensor.default
+        )
+        zero_points = [node.args[2] for node in dequant_nodes]
+        # Get quant nodes at output
+        quant_nodes = filter_nodes(
+            match.nodes, quantized_decomposed.quantize_per_tensor.default
+        )
+        assert len(quant_nodes) == 1, "expect only 1 add node at output quant pattern"
+        zero_points.append(quant_nodes[0].args[2])
+        if not all(zero_point == zero_points[0] for zero_point in zero_points):
+            return False
+
+        # Step 2: Check inputs/output scale
+        scales = [node.args[1] for node in dequant_nodes]
+        scales.append(quant_nodes[0].args[1])
+        if not all(math.isclose(scale, scales[0], rel_tol=1e-5) for scale in scales):  # type: ignore[arg-type]
+            return False
+
+        return True
+
+    return fn
+
+
+def _register_quantized_cat_lowering(
+    pattern,
+    computation_op,
+):
+    @register_lowering_pattern(
+        pattern,
+        extra_check=_is_input_output_same_scale_zp(aten.cat.default),
+    )
+    def qcat(match: Match, inputs, dim, **kwargs):
+        # inputs is with format: [[x1, x1_dq_dtype, x1_zp, x1_scale], ...]
+        uint8_inputs = [input[0] for input in inputs]
+        counters["inductor"]["qcat_matcher_count"] += 1
+        counters["inductor"]["qcat_matcher_nodes"] += len(match.nodes)
+        return L[computation_op](uint8_inputs, dim)
+
+    return qcat
+
+
+_raw_dequantize_per_tensor_activation_pattern = CallFunction(
+    quantized_decomposed.dequantize_per_tensor.default,
+    Arg(),
+    Arg(),
+    Arg(),
+    Arg(),
+    Arg(),
+    Arg(),
+)
+
+
+def _register_quantization_cat():
+    dequantize_cat_pattern = CallFunction(
+        aten.cat.default,
+        ListOf(_raw_dequantize_per_tensor_activation_pattern),
+        KeywordArg("dim"),
+    )
+    _register_quantized_cat_lowering(
+        generate_pattern_with_output_quant(dequantize_cat_pattern),
+        aten.cat,
+    )
+
+
+def _register_quantized_reshape_lowering(
+    pattern,
+    computation_op,
+):
+    @register_lowering_pattern(
+        pattern,
+        extra_check=_is_input_output_same_scale_zp(aten.reshape.default),
+    )
+    def qreshape(match: Match, *args, **kwargs):
+        qx = kwargs["x"]
+        shape = kwargs["shape"]
+        counters["inductor"]["qreshape_matcher_count"] += 1
+        counters["inductor"]["qreshape_matcher_nodes"] += len(match.nodes)
+        return L[computation_op](qx, shape)
+
+    return qreshape
+
+
+def _register_quantization_reshape():
+    dequantize_reshape_pattern = CallFunction(
+        torch.ops.aten.reshape.default,
+        get_dequantize_per_tensor_activation_pattern(),
+        KeywordArg("shape"),
+    )
+    _register_quantized_reshape_lowering(
+        generate_pattern_with_output_quant(dequantize_reshape_pattern),
+        aten.reshape,
+    )
+
+
+def _is_valid_concat_linear_int8_woq_optimization_pattern():
+    def fn(match):
+        if not config.cpp.enable_concat_linear:
+            return False
+        assert all(k in match.kwargs for k in ("x", "w1", "w2", "w3", "scales"))
+        if not all(
+            hasattr(match.kwargs[key], "meta")
+            for key in ["x", "w1", "w2", "w3", "scales"]
+        ):
+            return False
+        x = match.kwargs["x"].meta["val"]
+        w1 = match.kwargs["w1"].meta["val"]
+        w2 = match.kwargs["w2"].meta["val"]
+        w3 = match.kwargs["w3"].meta["val"]
+        scales = match.kwargs["scales"].meta["val"]
+        if len(match.kwargs["scales"].meta["val"].size()) > 1:
+            return False
+        num_scales = match.kwargs["scales"].meta["val"].numel()
+        w1_cols = match.kwargs["w1"].meta["val"].size()[0]
+        w2_cols = match.kwargs["w2"].meta["val"].size()[0]
+        w3_cols = match.kwargs["w3"].meta["val"].size()[0]
+        return (
+            # For now, we only support woq mm kernels
+            # with x.type=bfloat16 and w.type=int8
+            x.dtype == torch.bfloat16
+            and w1.dtype == torch.int8
+            and w2.dtype == torch.int8
+            and w3.dtype == torch.int8
+            and scales.dtype == torch.bfloat16
+            and x.device.type in ("cpu", "cuda")
+            and x.device == w1.device
+            and w1.device == w2.device
+            and w2.device == w3.device
+            and x.device == scales.device
+            and num_scales == w1_cols + w2_cols + w3_cols
+        )
+
+    return fn
+
+
+def _is_valid_woq_optimization_pattern():
+    def fn(match):
+        assert all(k in match.kwargs for k in ("x", "weight", "scales"))
+        if not all(
+            hasattr(match.kwargs[key], "meta") for key in ["x", "weight", "scales"]
+        ):
+            return False
+        x = match.kwargs["x"].meta["val"]
+        weight = match.kwargs["weight"].meta["val"]
+        scales = match.kwargs["scales"].meta["val"]
+        return (
+            # For now, we only support woq mm kernels
+            # with x.type=bfloat16 and w.type=int8
+            x.dtype == torch.bfloat16
+            and weight.dtype == torch.int8
+            and scales.dtype == torch.bfloat16
+            and x.device.type in ("cpu", "cuda")
+            and x.device == weight.device
+            and x.device == scales.device
+        )
+
+    return fn
+
+
+def _register_concat_linear_int8_woq_lowering(
+    pattern, computation_woq, computation_reshape
+):
+    @register_freezing_graph_pattern(
+        pattern,
+        extra_check=_is_valid_concat_linear_int8_woq_optimization_pattern(),
+        pass_number=4,
+    )
+    def woq_int8(match: Match, *args, **kwargs):
+        x = kwargs["x"]
+        w1 = kwargs["w1"]
+        w2 = kwargs["w2"]
+        w3 = kwargs["w3"]
+        scales = kwargs["scales"]
+        counters["inductor"]["woq_matcher_count"] += 1
+        counters["inductor"]["woq_matcher_nodes"] += len(match.nodes)
+        out_features = (
+            w1.meta["val"].size()[0]
+            + w2.meta["val"].size()[0]
+            + w3.meta["val"].size()[0]
+        )
+        origin_x_size = tuple(x.meta["val"].size())
+        x_shape = [-1, origin_x_size[-1]]
+        out_shape = list(origin_x_size[:-1] + (out_features,))
+        mm_node_of_x = None
+        for candidate in iter(x.users.keys()):
+            if (
+                candidate.target is aten.mm.default
+                and list(candidate._input_nodes)[1].target is aten.cat.default
+            ):
+                mm_node_of_x = candidate
+                break
+        assert mm_node_of_x is not None, "unable to find mm node"
+        _, cat_wgt_node = mm_node_of_x._input_nodes
+        scaling_node = next(iter(mm_node_of_x.users.keys()))
+        user_of_scaling_node = next(iter(scaling_node.users.keys()))
+        # Some other pass is making some changes that entails
+        # adding a node before it's used, but it can only be found when
+        # lint is run. stable_topological_sort() is being run before lint,
+        # so that error was not being being discovered.
+        # We call stable_topological_sort here as a workaround.
+        stable_topological_sort(match.graph)
+        with match.graph.inserting_before(user_of_scaling_node):
+            new_cat_node = match.graph.call_function(
+                aten.cat.default,
+                args=([w1, w2, w3], 0),
+            )
+            x_reshape_node = match.graph.call_function(
+                computation_reshape, args=(x, x_shape)
+            )
+            new_woq_node = match.graph.call_function(
+                computation_woq,
+                args=(x_reshape_node, new_cat_node, scales),
+            )
+            new_woq_node.meta = copy.copy(x.meta)
+            output_reshape_node = match.graph.call_function(
+                computation_reshape, args=(new_woq_node, out_shape)
+            )
+            scaling_node.replace_all_uses_with(output_reshape_node)
+            match.graph.erase_node(scaling_node)
+            match.graph.erase_node(mm_node_of_x)
+            match.graph.erase_node(cat_wgt_node)
+            match.graph.lint()
+
+    return woq_int8
+
+
+def _register_woq_lowering(pattern, computation_woq, computation_reshape):
+    @register_lowering_pattern(
+        pattern,
+        extra_check=_is_valid_woq_optimization_pattern(),
+    )
+    def woq_int8(match: Match, *args, **kwargs):
+        x = kwargs["x"]
+        weight = kwargs["weight"]
+        scales = kwargs["scales"]
+        counters["inductor"]["woq_matcher_count"] += 1
+        counters["inductor"]["woq_matcher_nodes"] += len(match.nodes)
+        out_features = weight.get_size()[0]
+        origin_x_size = x.get_size()
+        x_shape = [-1, origin_x_size[-1]]
+        out_shape = origin_x_size[:-1] + [
+            out_features,
+        ]
+        func1 = L[computation_reshape](x, x_shape)
+        func2 = L[computation_woq](func1, weight, scales)
+        return L[computation_reshape](func2, out_shape)
+
+    return woq_int8
+
+
+def _register_woq_mm_int8_pattern1():
+    # F.linear(x, weight.to(dtype=x.dtype)) * scales
+    # case of dispatching to mm, with x reshape
+    _woq_pattern = CallFunction(
+        aten.mul.Tensor,
+        CallFunction(
+            aten.reshape.default,
+            CallFunction(
+                aten.mm.default,
+                CallFunction(aten.reshape.default, KeywordArg("x"), Arg()),
+                CallFunction(
+                    aten.permute.default,
+                    CallFunction(
+                        prims.convert_element_type.default, KeywordArg("weight"), Arg()
+                    ),
+                    Arg(),
+                ),
+            ),
+            Arg(),
+        ),
+        KeywordArg("scales"),
+    )
+    _register_woq_lowering(_woq_pattern, aten._weight_int8pack_mm.default, aten.reshape)
+
+
+def _register_woq_mm_int8_pattern2():
+    # F.linear(x, weight.to(dtype=x.dtype)) * scales
+    # case of dispatching to mm, w/o x reshape
+    _woq_pattern = CallFunction(
+        aten.mul.Tensor,
+        CallFunction(
+            aten.reshape.default,
+            CallFunction(
+                aten.mm.default,
+                KeywordArg("x"),
+                CallFunction(
+                    aten.permute.default,
+                    CallFunction(
+                        prims.convert_element_type.default, KeywordArg("weight"), Arg()
+                    ),
+                    Arg(),
+                ),
+            ),
+            Arg(),
+        ),
+        KeywordArg("scales"),
+    )
+    _register_woq_lowering(_woq_pattern, aten._weight_int8pack_mm.default, aten.reshape)
+
+
+def _register_woq_mm_int8_pattern3():
+    # F.linear(x, weight.to(dtype=x.dtype)) * scales
+    # case of dispatching to bmm
+    _woq_pattern = CallFunction(
+        aten.mul.Tensor,
+        CallFunction(
+            aten.bmm.default,
+            CallFunction(aten.expand.default, KeywordArg("x"), Arg()),
+            CallFunction(
+                aten.expand.default,
+                CallFunction(
+                    aten.permute.default,
+                    CallFunction(
+                        prims.convert_element_type.default, KeywordArg("weight"), Arg()
+                    ),
+                    Arg(),
+                ),
+                Arg(),
+            ),
+        ),
+        KeywordArg("scales"),
+    )
+    _register_woq_lowering(_woq_pattern, aten._weight_int8pack_mm.default, aten.reshape)
+
+
+def _register_woq_mm_int8_pattern4():
+    _woq_pattern = CallFunction(
+        aten.mul.Tensor,
+        CallFunction(
+            aten.mm.default,
+            KeywordArg("x"),
+            CallFunction(
+                prims.convert_element_type.default,
+                CallFunction(
+                    aten.permute.default,
+                    KeywordArg("weight"),
+                    Arg(),
+                ),
+                Arg(),
+            ),
+        ),
+        KeywordArg("scales"),
+    )
+    _register_woq_lowering(_woq_pattern, aten._weight_int8pack_mm.default, aten.reshape)
+
+
+def _register_int8_woq_concat_linear_pattern():
+    def _create_wgt_node(wgt_node_name: str):
+        return CallFunction(
+            prims.convert_element_type.default,
+            CallFunction(
+                aten.permute.default,
+                KeywordArg(wgt_node_name),
+                Arg(),
+            ),
+            Arg(),
+        )
+
+    cat_wgt = CallFunction(
+        aten.cat.default, [_create_wgt_node(wgt) for wgt in ["w1", "w2", "w3"]], 1
+    )
+
+    _woq_pattern = CallFunction(
+        aten.mul.Tensor,
+        CallFunction(aten.mm.default, KeywordArg("x"), cat_wgt),
+        KeywordArg("scales"),
+    )
+    _register_concat_linear_int8_woq_lowering(
+        _woq_pattern, aten._weight_int8pack_mm.default, aten.reshape
+    )
+
+
+def _register_quantization_lowerings():
+    _register_quantization_unary_lowering()
+    _register_quantization_binary_lowering()
+    _register_quantization_maxpool2d()
+    _register_quantization_cat()
+    _register_quantization_reshape()
+
+
+def _register_woq_lowerings():
+    _register_woq_mm_int8_pattern1()
+    _register_woq_mm_int8_pattern2()
+    _register_woq_mm_int8_pattern3()
+    _register_woq_mm_int8_pattern4()
 
 
 def _is_valid_dequant_promotion_pattern(dtype=torch.float32):
